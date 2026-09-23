@@ -224,10 +224,18 @@ class CallLogRecord:
 class ProcessingStatus:
     """The spec names UNPROCESSED and PROCESSED. The rest are operational.
 
-    INGESTING marks a row claimed but whose audio is not up yet; FAILED and
-    SKIPPED exist so a call that will never be audited is visible rather than
-    absent — an absent call is one the reconciliation sweep rediscovers on every
-    pass forever. Only UNPROCESSED and PROCESSED reach the dashboard.
+    INGESTING marks a row claimed but whose audio is not up yet; FAILED exists
+    so a call that broke is visible rather than absent.
+
+    There is no SKIPPED. A call that was never answered or that the PBX kept no
+    recording for is not written at all -- step 3 drops it, the way it drops a
+    call belonging to an extension not on the roster. It used to be stored, so
+    that the sweep would not rediscover and re-check it on every run; the
+    re-check turned out to be two field comparisons on a row already fetched,
+    while the row was 200 bytes and put two thirds of the table in front of
+    every reader who then had to filter it back out. The call log remains the
+    record of what was not audited, and the run row carries the count and the
+    reasons.
     """
 
     INGESTING = "INGESTING"
@@ -238,7 +246,6 @@ class ProcessingStatus:
     # `dispatch._revive_legacy` reads them back into the work list.
     AUDITING = "AUDITING"
     PROCESSED = "PROCESSED"
-    SKIPPED = "SKIPPED"
     FAILED = "FAILED"
     DISCARDED = "DISCARDED"
 
@@ -343,14 +350,20 @@ class CallRow:
     auditStatus: str = ""
     # True when audit_call.py set `scores.disqualified`: misconduct that voids
     # the scorecard rather than lowering it. Such a call carries no score at
-    # all, and `score = None` cannot say so on its own -- a SKIPPED or FAILED
-    # call has no score either. This is the only attribute that distinguishes
+    # all, and `score = None` cannot say so on its own -- a FAILED call has no
+    # score either. This is the only attribute that distinguishes
     # "disqualified" from "never audited", and the dashboard's fatal tile and
     # filter are both it.
     disqualified: bool = False
-    # The seven scorecard sections, marks out of ten, copied off the audit.
-    # ~80 bytes that save one S3 GetObject per call on the strengths panel.
-    sectionMarks: Optional[dict] = None
+    # Every metric the scorecard awards, copied off the audit: the eight
+    # criteria and their marks. ~110 bytes that save one S3 GetObject per call
+    # on any panel that shows a breakdown.
+    #
+    # The criteria and not the six sections, because a section is exactly the
+    # sum of its criteria and so is derivable -- `hydrate` puts `sectionMarks`
+    # back for callers that only want that. Storing the sections was strictly
+    # less information for the same bytes.
+    criterionMarks: Optional[dict] = None
     # Why the last failure failed. Sparse: absent on a row that never failed,
     # and cleared when one succeeds.
     failureReason: str = ""
@@ -389,7 +402,7 @@ class CallRow:
     def workStatus(self):
         """The status while work is outstanding, or "" once it is not.
 
-        Written as GSI-1's partition key and *removed* at PROCESSED, SKIPPED or
+        Written as GSI-1's partition key and *removed* at PROCESSED or
         DISCARDED, which drops the row out of the index. Indexing every status
         instead would pile every call ever finished into one PROCESSED partition
         forever -- a hot partition, and a full copy of the table nobody reads.
@@ -411,8 +424,7 @@ class CallRow:
         to be said by storing `""`; it is now said by `processingStatus`, which
         had to be stored anyway and already means exactly that.
         """
-        if self.processingStatus in (ProcessingStatus.SKIPPED,
-                                     ProcessingStatus.DISCARDED):
+        if self.processingStatus == ProcessingStatus.DISCARDED:
             return ""
         return audio_key_for(self.callId, self.startedAt)
 
@@ -459,7 +471,7 @@ class CallRow:
         *name*, and a call whose extension is not on it does not reach here at
         all. What is no longer copied off it is `team`, `teamLeaderName`,
         `agentAccountId` and `agentDid` -- four attributes denormalised onto
-        every call to save an N+1 against the directory table. The read side
+        every call to save an N+1 against the roster. The read side
         caches that table whole already, so resolving them from
         `agentExtension` in memory costs nothing and removes the backfill that
         a denormalised copy needs every time somebody changes team.
@@ -502,7 +514,7 @@ class CallRow:
     STORED = (
         "processingStatus", "statusAt", "durationSec", "customerPhone",
         "callDirection", "agentName",
-        "score", "flagCount", "auditStatus", "disqualified", "sectionMarks",
+        "score", "flagCount", "auditStatus", "disqualified", "criterionMarks",
         "failureReason",
     )
 
@@ -527,6 +539,65 @@ class CallRow:
         item.update(self.index_keys())
         return item
 
+
+
+# ------------------------------------------------------------------------
+# the scorecard
+# ------------------------------------------------------------------------
+
+def _score_sections():
+    """`audit_schema.SCORE_SECTIONS`, or None if it cannot be imported.
+
+    Imported lazily and by path rather than declared here, because the marking
+    scheme has exactly one definition and a second copy in this module is a
+    second thing to keep honest -- the kind that goes wrong silently, months
+    later, when somebody adds a criterion in one place.
+
+    None rather than an exception when it is missing: `hydrate` runs on every
+    read, and a call should still come back without its section roll-up if the
+    schema module is not importable for some reason.
+    """
+    import sys
+
+    from .config import REPO_ROOT
+
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    try:
+        from audit_schema import SCORE_SECTIONS
+    except Exception:  # noqa: BLE001 -- see the docstring
+        return None
+    return SCORE_SECTIONS
+
+
+def section_marks(criterion_marks):
+    """The six section totals, summed from the criteria.
+
+    A section is exactly the sum of its criteria -- checked against every
+    document in the corpus, 100 of 100 -- which is why only the criteria are
+    stored. This is the other half of that trade.
+
+    A criterion the audit did not mark is left out of the sum rather than
+    counted as zero, and a section with nothing marked is omitted entirely:
+    zero is a real mark an agent can score, so a defaulted zero is
+    indistinguishable from a bad one.
+    """
+    if not criterion_marks:
+        return None
+    sections = _score_sections()
+    if not sections:
+        return None
+
+    out = {}
+    for section in sections:
+        marks = [
+            criterion_marks[name]
+            for name, _, _ in section["criteria"]
+            if criterion_marks.get(name) is not None
+        ]
+        if marks:
+            out[section["key"]] = sum(marks)
+    return out or None
 
 # ------------------------------------------------------------------------
 # reading a row back
@@ -585,8 +656,7 @@ def hydrate(item):
         row.setdefault("dateKey", layout.date_key(started))
         row.setdefault(
             "audioKey",
-            "" if status in (ProcessingStatus.SKIPPED,
-                             ProcessingStatus.DISCARDED)
+            "" if status == ProcessingStatus.DISCARDED
             else layout.audio_key(call_id, started),
         )
         row.setdefault(
@@ -597,5 +667,12 @@ def hydrate(item):
 
     if "score" in row or status == ProcessingStatus.PROCESSED:
         row.setdefault("scoreBand", score_band(row.get("score")))
+
+    # The section roll-up, summed from the criteria the row does store. Every
+    # reader that asked for `sectionMarks` before the row stopped carrying it
+    # still gets it, and gets the breakdown underneath it as well.
+    if row.get("criterionMarks") and "sectionMarks" not in row:
+        if rolled := section_marks(row["criterionMarks"]):
+            row["sectionMarks"] = rolled
 
     return row

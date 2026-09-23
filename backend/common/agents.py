@@ -67,9 +67,10 @@ class Agent:
     known: bool = True
     # The reporting line, from the roster sheet rather than from Cloud Connect —
     # the PBX has no concept of a team. An agent with a `tl` is on the audited
-    # floor: the dashboard groups them under that leader and seed_demo seeds
-    # them. An agent without one is a live extension that still ingests and
-    # still resolves to a name, but is not reported on.
+    # floor: the dashboard groups them under that leader and the day roll-ups
+    # file their calls under that team. An agent without one is a live
+    # extension that still ingests and still resolves to a name, but is not
+    # reported on.
     tl: str = ""
     state: str = ""
 

@@ -266,9 +266,13 @@ def dashboard_fields(document):
         # The only attribute that tells a disqualified call apart from one that
         # was never audited -- both carry no score.
         "disqualified": disqualified,
-        # The seven sections, so the dashboard's strengths panel is a row read
-        # rather than one S3 GetObject per call.
-        "sectionMarks": scores.get("section_marks") or None,
+        # Every metric the scorecard awards, at the finest level the audit
+        # produces: the eight criteria, not the six sections. Sections are the
+        # sum of their criteria -- verified against every document in the
+        # corpus -- so storing the criteria stores both, and `models.hydrate`
+        # adds `sectionMarks` back on read. Storing the sections instead threw
+        # away the breakdown for the same number of bytes.
+        "criterionMarks": scores.get("criterion_marks") or None,
     }
 
 
@@ -304,7 +308,6 @@ REQUIRED_MODEL = "gpt-5.6-luna"
 # somebody or something took out of the work list after the message was sent.
 TERMINAL = frozenset({
     ProcessingStatus.PROCESSED,
-    ProcessingStatus.SKIPPED,
     ProcessingStatus.DISCARDED,
 })
 

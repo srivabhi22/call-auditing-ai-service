@@ -9,7 +9,9 @@ key. Four things live in it, in the order they depend on each other:
     keys            where a call's audio and artifacts live in S3
     S3ObjectStore   put/get/presign against the media bucket
     DynamoCallsRepository   the `calls` table and its three indexes
-    DirectoryRepository     the `directory` table -- the roster
+    publish_roster          agents.json -> S3, for the dashboard
+    RollupsRepository       the `rollups` table -- a day's totals per scope
+    SessionsRepository      the `sessions` table -- did the night finish?
 
 It used to be a package of eight modules, half of which were a second
 implementation backed by JSON files on disk. That backend existed so the AI
@@ -479,7 +481,7 @@ INDEX_KEY_ATTRIBUTES = frozenset(
 ALL_STATUSES = (
     ProcessingStatus.INGESTING, ProcessingStatus.UNPROCESSED,
     ProcessingStatus.AUDITING, ProcessingStatus.PROCESSED,
-    ProcessingStatus.SKIPPED, ProcessingStatus.FAILED,
+    ProcessingStatus.FAILED,
     ProcessingStatus.DISCARDED,
 )
 
@@ -701,7 +703,7 @@ class DynamoCallsRepository:
         return self.update(
             call_id,
             processingStatus=ProcessingStatus.DISCARDED,
-            score=None, flagCount=None, sectionMarks=None,
+            score=None, flagCount=None, criterionMarks=None,
             auditStatus=None, disqualified=None,
             agentName=None, customerPhone=None,
             gsi2pk=None, gsi3pk=None,
@@ -863,20 +865,137 @@ class DynamoCallsRepository:
 
 
 # ------------------------------------------------------------------------
-# the directory table -- the roster
+# the roster -- agents.json, published to S3
 # ------------------------------------------------------------------------
 
-# The sort key every roster row carries, agent and team alike. Constant for the
-# same reason `calls` uses META: it makes each agent an item collection, so a
-# sibling row can be added later and read with the profile in one query. It is
-# also `gsi1sk` on the extension lookup, where the profile is the only thing
-# that index has to find.
-PROFILE = "PROFILE"
+# There was a `directory` DynamoDB table here, one row per agent and team,
+# written by a deploy and scanned whole by both this service and the dashboard.
+# It is gone. The roster it held was a transcription of `agents.json`, which is
+# the file a human actually edits -- so the table was a second copy of the
+# truth, kept in step by remembering to run a seeding command, and the two
+# silently disagreeing was a class of bug nobody could see.
+#
+# Now the file *is* the roster. This service reads it from disk (see
+# `common/agents.py`, which reloads it when the mtime changes, so a correction
+# needs no restart), and publishes it to S3 for the dashboard -- which lives in
+# another repo, on another deployment, and would otherwise need its own copy.
+#
+# One object, rewritten at the start of every run. It is ~2 KB, the dashboard
+# caches it for ten minutes, and the alternative -- a roster the dashboard
+# groups by that is not the roster this service filters on -- puts calls and
+# their agents on different sides of a disagreement nobody notices until a
+# month of reports is wrong.
+ROSTER_KEY = "roster/agents.json"
 
 
-class DirectoryRepository:
+def publish_roster(agents, store=None, key=ROSTER_KEY):
+    """Write the roster to S3, as the shape the dashboard reads.
+
+    Not the raw file: the on-disk JSON carries `_comment` keys and the roster's
+    own spelling of a DID, and pushing the file verbatim would make every
+    reader re-implement `common.agents`'s normalisation. What goes up is the
+    resolved `Agent` list -- DIDs normalised to ten digits, teams and leaders
+    named -- so a reader needs no knowledge of the file format at all.
+
+    `audited` is carried rather than filtered on. Who is reported on is the
+    reader's decision: this service still ingests and names a call from a live
+    extension that has no team leader, and the dashboard still has to render it
+    somewhere rather than have it vanish between the two.
+    """
+    store = store or objects
+    document = {
+        "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "agents": [
+            {
+                "extension": agent.extension,
+                "name": agent.name,
+                "did": agent.did_key,
+                "accountId": agent.accountId,
+                "team": agent.state or "",
+                "teamLeaderName": agent.tl or "",
+                "audited": agent.audited,
+            }
+            for agent in sorted(agents, key=lambda a: a.extension)
+        ],
+    }
+    store.put_json(key, document)
+    db(f"roster published: {len(document['agents'])} agent(s) -> {key}")
+    return document
+
+
+def read_roster(store=None, key=ROSTER_KEY):
+    """The published roster, or None when it has never been written."""
+    return (store or objects).read_json(key)
+
+
+# ------------------------------------------------------------------------
+# the rollups table -- a day's totals, at three scopes
+# ------------------------------------------------------------------------
+
+# One row per scope per day:
+#
+#     PK                        SK
+#     OVERALL                   2026-09-20      the whole floor
+#     TEAM#MP                   2026-09-20      one team
+#     AGENT#MP#pankaj-kourav    2026-09-20      one agent, under their team
+#
+# The scope is in the partition key and the day is the sort key, so "this team,
+# last 30 days" is one query of 30 small rows rather than 30 day-partitions of
+# GSI-3 and a few thousand call rows aggregated in the API process. Every
+# number on the row is a *sum* or an extreme, never an average: averages do not
+# add up, so the row carries `scoreSum` and `scoredCalls` and the caller
+# divides once, at the end of the span it is actually showing.
+#
+# The agent key is `AGENT#<team>#<name>` rather than the extension the calls
+# table keys by, because these rows are read by a dashboard and written by one
+# batch job -- readability wins where nothing joins on it. The extension is on
+# the row as an attribute for anything that has to get back to the call rows.
+SCOPE_OVERALL = "OVERALL"
+SCOPE_TEAM = "TEAM"
+SCOPE_AGENT = "AGENT"
+
+# Where an agent the roster gives no team to is filed. Such an agent still has
+# calls, and dropping them would make the teams stop summing to the floor --
+# the exact disagreement that retired the old team index (see `query`).
+UNASSIGNED_TEAM = "UNASSIGNED"
+
+# GSI-1 on this table: every row of one scope, by day. What "all teams on
+# 2026-09-20", or a leaderboard over a span, reads -- the base table can only
+# answer for one team or one agent at a time. The partition is a scope name, so
+# there are exactly three of them; at one row per agent per day that is tens of
+# thousands of small rows a year, which is a partition DynamoDB does not notice.
+INDEX_SCOPE = "scope-date-index"
+
+
+def rollup_pk(scope, team="", agent_key=""):
+    """The partition key for a scope. The one place the key shape is spelled."""
+    if scope == SCOPE_OVERALL:
+        return SCOPE_OVERALL
+    team = team or UNASSIGNED_TEAM
+    if scope == SCOPE_TEAM:
+        return f"{SCOPE_TEAM}#{team}"
+    if scope == SCOPE_AGENT:
+        if not agent_key:
+            raise ValueError("an agent rollup needs an agent key")
+        return f"{SCOPE_AGENT}#{team}#{agent_key}"
+    raise ValueError(f"unknown rollup scope {scope!r}")
+
+
+def rollup_scope(pk):
+    """(scope, team, agent_key) back out of a partition key."""
+    parts = str(pk or "").split("#")
+    if parts[0] == SCOPE_OVERALL:
+        return SCOPE_OVERALL, "", ""
+    if parts[0] == SCOPE_TEAM and len(parts) == 2:
+        return SCOPE_TEAM, parts[1], ""
+    if parts[0] == SCOPE_AGENT and len(parts) == 3:
+        return SCOPE_AGENT, parts[1], parts[2]
+    return "", "", ""
+
+
+class RollupsRepository:
     def __init__(self, table_name=None, endpoint_url=None):
-        self.table_name = table_name or settings.directory_table
+        self.table_name = table_name or settings.rollups_table
         self.endpoint_url = endpoint_url or settings.dynamo_endpoint_url
         self._table = None
 
@@ -890,92 +1009,217 @@ class DirectoryRepository:
 
     # -- writes -----------------------------------------------------------
 
-    def put_agent(self, agent):
-        """One roster row. `agent` is a common.agents.Agent."""
-        item = {
-            "PK": f"AGENT#{agent.accountId or agent.extension}",
-            "SK": PROFILE,
-            "entity": "AGENT",
-            "accountId": agent.accountId,
-            "extension": agent.extension,
-            "agentName": agent.name,
-            "did": agent.did_key,
-            "team": agent.state or "",
-            "teamLeaderName": agent.tl or "",
-            # Everyone on the audited floor is active; the roster has no way to
-            # say otherwise yet. Stored anyway so the admin screen has the
-            # column it renders, rather than inferring "active" from presence.
-            "active": True,
-            "gsi1pk": f"EXT#{agent.extension}",
-            "gsi1sk": PROFILE,
-        }
-        if agent.state:
-            item["gsi2pk"] = f"TEAM#{agent.state}"
-            item["gsi2sk"] = f"AGENT#{agent.name}"
-        self.table.put_item(Item=clean_item(item, frozenset(item)))
-        return item["PK"]
+    def put_many(self, items):
+        """Write a day's rows. Whole-row puts, not counter updates.
 
-    def put_team(self, team_id, leader_name, display_name=""):
-        item = {
-            "PK": f"TEAM#{team_id}",
-            "SK": PROFILE,
-            "entity": "TEAM",
-            "teamId": team_id,
-            "name": display_name or f"{team_id} board",
-            "leaderName": leader_name,
-            "gsi2pk": f"TEAM#{team_id}",
-            "gsi2sk": "PROFILE#team",
-        }
-        self.table.put_item(Item=clean_item(item, frozenset(item)))
-        return item["PK"]
+        A roll-up is rebuilt from the call rows rather than incremented as
+        calls land, so writing is idempotent by construction: run it twice on
+        the same day and the second put lands the same numbers. Incrementing
+        would be cheaper and would drift the first time a call is re-audited,
+        a run is retried, or a row is corrected by hand -- and a counter that
+        has drifted cannot be told apart from one that has not.
+        """
+        written = 0
+        with self.table.batch_writer() as writer:
+            for item in items:
+                writer.put_item(Item=clean_item(item, ("PK", "SK", "scope")))
+                written += 1
+        db(f"rollups put {written} row(s)")
+        return written
 
-    def sync_from(self, agents):
-        """Push the audited floor and the teams it implies. Returns counts."""
-        teams = {}
-        for agent in agents:
-            self.put_agent(agent)
-            if agent.state:
-                # Last writer wins on the leader name. The roster has one `tl`
-                # per agent, so a team with two different leaders written next
-                # to each other is a roster error worth seeing, not merging.
-                teams[agent.state] = agent.tl
-        for team_id, leader in sorted(teams.items()):
-            self.put_team(team_id, leader)
-        db(f"directory sync {len(agents)} agents, {len(teams)} teams")
-        return {"agents": len(agents), "teams": len(teams)}
+    def delete_many(self, keys):
+        """Remove rows by (PK, SK). What a rebuild does with a scope that no
+        longer has any calls on that day -- an agent who left, or a day whose
+        rows were wiped and re-seeded. Left alone, such a row is a number the
+        dashboard keeps adding into a span forever.
+        """
+        removed = 0
+        with self.table.batch_writer() as writer:
+            for pk, sk in keys:
+                writer.delete_item(Key={"PK": pk, "SK": sk})
+                removed += 1
+        if removed:
+            db(f"rollups deleted {removed} stale row(s)")
+        return removed
 
     # -- reads ------------------------------------------------------------
 
-    def by_extension(self, extension):
-        response = self.table.query(
-            IndexName="ext-lookup-index",
-            KeyConditionExpression="gsi1pk = :k",
-            ExpressionAttributeValues={":k": f"EXT#{extension}"},
-            Limit=1,
-        )
-        items = response.get("Items") or []
-        return from_dynamo(items[0]) if items else None
+    def get(self, pk, date):
+        response = self.table.get_item(Key={"PK": pk, "SK": date})
+        item = response.get("Item")
+        return from_dynamo(item) if item else None
 
-    def team_roster(self, team_id):
-        response = self.table.query(
-            IndexName="team-roster-index",
-            KeyConditionExpression="gsi2pk = :k",
-            ExpressionAttributeValues={":k": f"TEAM#{team_id}"},
-        )
-        return [from_dynamo(i) for i in response.get("Items", [])]
+    def span(self, pk, start=None, end=None):
+        """One scope over a date range, oldest day first.
 
-    def load_all(self):
-        """Every row. A scan, deliberately: the table is tens of items and this
-        is called once per process, so an index would cost more than it saves.
+        `start` and `end` are `yyyy-mm-dd` and both inclusive.
         """
-        rows, kwargs = [], {}
+        condition = "PK = :k"
+        values = {":k": pk}
+        if start and end:
+            condition += " AND SK BETWEEN :s AND :e"
+            values[":s"], values[":e"] = start[:10], end[:10]
+        elif start:
+            condition += " AND SK >= :s"
+            values[":s"] = start[:10]
+        elif end:
+            condition += " AND SK <= :e"
+            values[":e"] = end[:10]
+        return self._query({
+            "KeyConditionExpression": condition,
+            "ExpressionAttributeValues": values,
+        })
+
+    def scope_span(self, scope, start=None, end=None):
+        """Every row of one scope across a range — all teams, or all agents.
+
+        GSI-1, because the base table partitions by the individual team or
+        agent and so cannot answer "all of them" without one query each.
+        """
+        # `#s`, because `scope` is a DynamoDB reserved word and a bare one in a
+        # key condition is a ValidationException, not a wrong answer.
+        condition = "#s = :k"
+        values = {":k": scope}
+        if start and end:
+            condition += " AND SK BETWEEN :s AND :e"
+            values[":s"], values[":e"] = start[:10], end[:10]
+        elif start:
+            condition += " AND SK >= :s"
+            values[":s"] = start[:10]
+        elif end:
+            condition += " AND SK <= :e"
+            values[":e"] = end[:10]
+        return self._query({
+            "IndexName": INDEX_SCOPE,
+            "KeyConditionExpression": condition,
+            "ExpressionAttributeNames": {"#s": "scope"},
+            "ExpressionAttributeValues": values,
+        })
+
+    def day(self, scope, date):
+        """Every row of one scope on one day. What a rebuild diffs against."""
+        return self.scope_span(scope, date, date)
+
+    def _query(self, kwargs):
+        rows = []
         while True:
-            response = self.table.scan(**kwargs)
+            response = self.table.query(**kwargs)
             rows.extend(from_dynamo(i) for i in response.get("Items", []))
-            if "LastEvaluatedKey" not in response:
-                break
-            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
-        return rows
+            cursor = response.get("LastEvaluatedKey")
+            if not cursor:
+                return rows
+            kwargs["ExclusiveStartKey"] = cursor
+
+
+
+# ------------------------------------------------------------------------
+# the sessions table -- did the night finish?
+# ------------------------------------------------------------------------
+
+# One item per processing session:
+#
+#     PK                          SK
+#     SESSION#2026-09-23T02:00:04Z   PENDING      while the run is working
+#     SESSION#2026-09-23T02:00:04Z   COMPLETED    every queued job is done
+#
+# **The status is the sort key, so it is not updated -- it is replaced.**
+# DynamoDB cannot change a key attribute on an existing item, so finishing a
+# session is a put of the COMPLETED item followed by a delete of the PENDING
+# one. In that order: a reader that lands between the two sees both and takes
+# COMPLETED, which is the right answer, where the other order would show a
+# session that had briefly never existed.
+#
+# A session left saying PENDING is therefore a real signal and not a bug -- it
+# is a pod that was killed, or a run that could not reach the end. That is the
+# whole reason the row is written at the start rather than only at the end: a
+# marker that only ever appears on success cannot describe the case anyone
+# actually needs it for.
+#
+# No index. Every access is by a session whose start is already known -- the
+# run writing its own two rows, or a reader asking after one -- which the
+# primary key answers on its own. An index on the status would be a second
+# copy of the table written on every put and delete, to answer a question
+# ("which sessions are still PENDING?") that a scan of a few hundred tiny rows
+# answers well enough on the rare occasion anybody asks it.
+SESSION_PREFIX = "SESSION#"
+SESSION_PENDING = "PENDING"
+SESSION_COMPLETED = "COMPLETED"
+
+
+def session_pk(started_at_iso):
+    """`SESSION#<iso started>`. The run's own start, never `now`: the two rows
+    of one session have to share a partition, and the second is written hours
+    after the first."""
+    return f"{SESSION_PREFIX}{started_at_iso}"
+
+
+class SessionsRepository:
+    def __init__(self, table_name=None, endpoint_url=None):
+        self.table_name = table_name or settings.sessions_table
+        self.endpoint_url = endpoint_url or settings.dynamo_endpoint_url
+        self._table = None
+
+    @property
+    def table(self):
+        if self._table is None:
+            self._table = resource(
+                "dynamodb", self.endpoint_url
+            ).Table(self.table_name)
+        return self._table
+
+    # -- writes -----------------------------------------------------------
+
+    def start(self, started_at_iso, **fields):
+        """The PENDING row, written before any work is taken up."""
+        item = {
+            "PK": session_pk(started_at_iso),
+            "SK": SESSION_PENDING,
+            "status": SESSION_PENDING,
+            "sessionId": started_at_iso,
+            "startedAt": started_at_iso,
+            "totalCallsProcessed": 0,
+            "callsFailed": 0,
+            **fields,
+        }
+        self.table.put_item(Item=clean_item(item, ("PK", "SK")))
+        db(f"session {item['PK']} PENDING")
+        return item
+
+    def complete(self, started_at_iso, **fields):
+        """Replace the PENDING row with a COMPLETED one.
+
+        Put first, delete second -- see the note above the class. The delete is
+        unconditional: a session with no PENDING row (a re-run of `complete`,
+        or a row someone removed by hand) still ends up with exactly the
+        COMPLETED row it should have.
+        """
+        item = {
+            "PK": session_pk(started_at_iso),
+            "SK": SESSION_COMPLETED,
+            "status": SESSION_COMPLETED,
+            "sessionId": started_at_iso,
+            "startedAt": started_at_iso,
+            **fields,
+        }
+        self.table.put_item(Item=clean_item(item, ("PK", "SK")))
+        self.table.delete_item(
+            Key={"PK": session_pk(started_at_iso), "SK": SESSION_PENDING}
+        )
+        db(f"session {item['PK']} COMPLETED")
+        return item
+
+    # -- reads ------------------------------------------------------------
+
+    def get(self, started_at_iso):
+        """The session, whichever state it is in. Both rows if it is mid-swap."""
+        response = self.table.query(
+            KeyConditionExpression="PK = :pk",
+            ExpressionAttributeValues={":pk": session_pk(started_at_iso)},
+        )
+        rows = [from_dynamo(i) for i in response.get("Items", [])]
+        # COMPLETED sorts before PENDING, and is the truth when both are there.
+        return rows[0] if rows else None
+
 
 
 
@@ -985,7 +1229,9 @@ class DirectoryRepository:
 
 calls = DynamoCallsRepository()
 objects = S3ObjectStore()
-directory_table = DirectoryRepository()
+rollups = RollupsRepository()
+sessions = SessionsRepository()
 
-boot(f"storage  dynamodb tables={settings.calls_table},{settings.directory_table} "
+boot(f"storage  dynamodb tables={settings.calls_table},{settings.rollups_table},"
+     f"{settings.sessions_table} "
      f"s3 bucket={settings.audio_bucket} region={settings.aws_region}")

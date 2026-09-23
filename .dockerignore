@@ -10,13 +10,9 @@ __pycache__/
 data/
 workdir/
 backups/
-# ~900 MB of real customer recordings and their transcripts, used only by the
-# replay tools against a test account. It has no business in a production image
-# and no business in the repository either -- see .gitignore.
+# ~900 MB of real customer recordings and their transcripts. They have no
+# business in a production image and none in the repository either -- see
+# .gitignore.
 files/
-# The rehearsal harness. It is safe to ship and is genuinely useful for
-# verifying a fresh environment, so it stays -- but nothing in the image's
-# entrypoint reaches it.
-docker-compose.sim.yml
 *.pdf
 *.docx

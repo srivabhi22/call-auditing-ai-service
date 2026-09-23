@@ -25,17 +25,33 @@ run id as soon as the run has been accepted, and the result is read from the run
 row afterwards. A synchronous version of this endpoint would be a request that
 every proxy between here and the caller would time out.
 
-── Why it is locked down by default ─────────────────────────────────────────
+── Access ───────────────────────────────────────────────────────────────────
 
-An unauthenticated trigger is a button that spends money: a loop of requests is
-a loop of Soniox and OpenAI bills, and `POST /v1/runs` will also pull ~97 GB a
-day from a partner's server. So `PIPELINE_TRIGGER_TOKEN` is required, and if it
-is unset the endpoints refuse rather than opening -- a service that fails open
-when its config is missing is one that is open in exactly the environment where
-somebody forgot to configure it.
+Open by default. This is an internal service on a company network, and the
+blast radius of an unwanted trigger is small by construction rather than by
+policy: a second concurrent trigger gets 409 instead of a second run, and
+re-running a day already collected downloads nothing and audits nothing,
+because step 3 asks the table which ids it already holds.
 
-The health endpoints are deliberately unauthenticated: kubelet does not send
+What is *not* free is a trigger carrying an explicit `windowStart` far in the
+past. That is a backfill, it fetches and audits for real, and `maxCalls` is the
+only thing bounding it.
+
+Setting `PIPELINE_TRIGGER_TOKEN` turns the lock on: with it set, every trigger
+must present the same value as `X-Trigger-Token` or be refused. Unset, the
+endpoints are open. It is checked this way round -- rather than required -- so
+that closing the door later is configuration and not a deploy of new code.
+
+The health endpoints are never checked either way: kubelet does not send
 headers, and neither reveals anything or starts anything.
+
+── Nothing here triggers itself ─────────────────────────────────────────────
+
+There is no schedule inside this process and no run on startup. The pod comes
+up, answers its probes and stays idle until something outside asks it for a
+run. That is deliberate: a pod that starts working the moment it boots turns
+every restart, rollout and autoscaling event into another run, which is the one
+thing a job that costs money per call must not do.
 """
 
 import os
@@ -53,15 +69,10 @@ from . import runner
 
 configure()
 
-# The shared secret a trigger has to present. No default: see the module
-# docstring on why this refuses rather than opening.
+# Optional. Set it and every trigger must present the same value as
+# `X-Trigger-Token`; leave it unset and the endpoints are open. See the module
+# docstring on why open is the default here.
 TRIGGER_TOKEN = os.environ.get("PIPELINE_TRIGGER_TOKEN", "").strip()
-
-# What to start when the process comes up: "full", "audit", or "" for nothing.
-# This is the "trigger it when the pod gets up" path -- it needs no probe, no
-# sidecar and no postStart hook, and it cannot race the server becoming ready
-# because it runs after the app has started.
-RUN_ON_STARTUP = os.environ.get("RUN_ON_STARTUP", "").strip().lower()
 
 # How long shutdown waits for a run in flight before letting the process go.
 # Zero by default: a pod being replaced mid-run is an ordinary event, the rows
@@ -121,18 +132,14 @@ class RunAccepted(BaseModel):
 # ------------------------------------------------------------------------
 
 def require_trigger_token(x_trigger_token: str = Header(default="")):
-    """The shared secret, or 401/503.
+    """The shared secret, when there is one. A no-op when there is not.
 
-    503 rather than 401 when the token is unset, because that is a broken
-    deployment and not a rejected caller -- and because 401 would invite
-    somebody to go looking for the right credential when there isn't one.
+    Unset means open, which is the deployed default -- see the module docstring.
+    Set means enforced, so a deployment can be locked down without a code
+    change.
     """
     if not TRIGGER_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="PIPELINE_TRIGGER_TOKEN is not configured, so this endpoint "
-                   "refuses to start anything. Set it on the deployment.",
-        )
+        return
     # Constant-time, so the comparison does not leak the prefix it matched.
     import hmac
 
@@ -148,25 +155,13 @@ def require_trigger_token(x_trigger_token: str = Header(default="")):
 async def lifespan(app: FastAPI):
     batch(f"api up — region={settings.aws_region} "
           f"bucket={settings.audio_bucket} "
-          f"tables={settings.calls_table}/{settings.directory_table} "
+          f"tables={settings.calls_table}/{settings.rollups_table} "
           f"pipeline={settings.pipeline_mode} "
           f"concurrency={settings.audit_concurrency}")
-    if not TRIGGER_TOKEN:
-        warn("api", "PIPELINE_TRIGGER_TOKEN is not set — every trigger will be "
-                    "refused with 503. This is deliberate: an open trigger is a "
-                    "button that spends money.")
-
-    if RUN_ON_STARTUP in ("full", "audit"):
-        batch(f"RUN_ON_STARTUP={RUN_ON_STARTUP} — starting a run now")
-        try:
-            state = runner.start(RUN_ON_STARTUP, trigger="startup")
-            batch(f"startup run {state.run_id} is in flight")
-        except Exception as exc:  # noqa: BLE001 -- a failed startup run must
-            # not stop the pod from serving; the trigger endpoints still work.
-            warn("api", f"the startup run could not be started: {exc!r}")
-    elif RUN_ON_STARTUP:
-        warn("api", f"RUN_ON_STARTUP={RUN_ON_STARTUP!r} is not one of "
-                    f"'full', 'audit' or empty — nothing was started")
+    batch("trigger auth: " + (
+        "X-Trigger-Token required" if TRIGGER_TOKEN
+        else "OPEN — anyone who can reach this pod can start a run"
+    ))
 
     yield
 
@@ -212,7 +207,7 @@ def readyz(response: Response):
     checks, ok = {}, True
     try:
         dynamo = store.client("dynamodb", settings.dynamo_endpoint_url)
-        for table in (settings.calls_table, settings.directory_table):
+        for table in (settings.calls_table, settings.rollups_table):
             dynamo.describe_table(TableName=table)
             checks[f"dynamodb:{table}"] = "ok"
     except Exception as exc:  # noqa: BLE001
@@ -227,9 +222,7 @@ def readyz(response: Response):
         checks["s3"] = f"{type(exc).__name__}: {exc}"
         ok = False
 
-    if not TRIGGER_TOKEN:
-        checks["trigger-token"] = "NOT CONFIGURED — triggers will 503"
-        ok = False
+    checks["trigger-auth"] = "token required" if TRIGGER_TOKEN else "open"
 
     if not ok:
         response.status_code = 503
@@ -294,9 +287,8 @@ def start_full_run(body: RunRequest = RunRequest()):
     """Steps 1-6: fetch the day from the call log, filter it to the roster,
     download the recordings to S3, queue every UNPROCESSED call and audit it.
 
-    This is what a scheduled pod does at 02:00, and what `RUN_ON_STARTUP=full`
-    starts when the pod comes up. An empty body means the most recent complete
-    business day.
+    This is what a scheduler calls at 02:00. An empty body means the most
+    recent complete business day.
     """
     return _start("full", body)
 

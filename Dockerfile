@@ -42,7 +42,8 @@ EXPOSE 8000
 #   POST /v1/runs         the full pass, call log included
 #   POST /v1/runs/audit   the same run with the fetch left out
 #
-# Set RUN_ON_STARTUP=full to have the pod trigger itself as it comes up.
+# Nothing here triggers itself: the pod stays idle until something outside calls
+# one of those endpoints, which are open unless PIPELINE_TRIGGER_TOKEN is set.
 #
 # **One worker, deliberately.** The run is a process-wide singleton — the job
 # queue is module state — so a second uvicorn worker would be a second pod's
@@ -52,7 +53,7 @@ EXPOSE 8000
 # UNPROCESSED index and a call another pod finished is dropped by one row read.
 #
 # Split the work across pods once one is not enough (§7 of the architecture
-# doc): one on RUN_ON_STARTUP=full, two or three triggered on /v1/runs/audit.
+# doc): trigger one on /v1/runs and two or three on /v1/runs/audit.
 #
 # No HEALTHCHECK: Kubernetes has its own probes and a Docker healthcheck is
 # ignored there. Point livenessProbe at /healthz and readinessProbe at /readyz.

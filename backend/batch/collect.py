@@ -49,8 +49,10 @@ puts every row in one of four piles:
                      belong to other departments, IVR legs and test handsets.
                      Dropped with no row: the test is a dict lookup, so
                      re-checking it tomorrow costs nothing.
-    not auditable    never answered, or no recording -- store a SKIPPED row so
-                     tomorrow's run does not rediscover and re-check it
+    not auditable    never answered, or no recording. Dropped with no row, for
+                     the same reason an off-roster call is: deciding it is a
+                     field comparison on a row we already fetched, so
+                     re-deciding it tomorrow costs nothing
     to do            a real recorded call nobody has seen. The work list.
 
 Neither step spends money: no downloads, no transcription, no model calls. That
@@ -78,10 +80,8 @@ from datetime import timedelta
 
 from ..common.agents import Agent, directory as file_directory
 from ..common.config import settings
-from ..common.models import (
-    CallRow, ProcessingStatus, TENANT_TZ, iso, parse_iso, utcnow,
-)
-from ..common.store import calls as calls_repo, directory_table
+from ..common.models import TENANT_TZ, iso, parse_iso, utcnow
+from ..common.store import calls as calls_repo
 from ..common.trace import batch, trace, warn, error
 from .cloudconnect import client as cc_client, RetryableError, PermanentError
 
@@ -216,22 +216,23 @@ BATCH_GET_SIZE = 100
 
 
 class AgentCache:
-    """Extension -> Agent, read once per run.
+    """Extension -> Agent, from `agents.json`.
 
-    Step 4 resolves an agent for every call in the window. Against the
-    `directory` table that is one GSI-1 query per call -- 3,000 reads of a
-    table with eight rows in it. The roster changes on the order of once a
-    month, so it is loaded whole, once, and served from a dict.
+    Step 4 resolves an agent for every call in the window, so the roster is
+    loaded whole and served from a dict rather than looked up per call.
 
-    `agents.json` is the fallback, not the primary: the table is what a deploy
-    updates and the file is what a developer edits, and a run that cannot reach
-    the table should still file calls under the right people rather than under
-    "Unmapped extension 706".
+    This used to read a `directory` DynamoDB table and fall back to the file.
+    The table is gone: it was a transcription of this same file, kept in step by
+    remembering to run a seeding command, and two rosters that can disagree is
+    worse than one roster that can be out of date. `common.agents` reloads the
+    file when its mtime changes, so a correction still needs no restart.
+
+    The roster is published to S3 at the start of a run (`store.publish_roster`)
+    for the dashboard, which is a separate deployment and cannot read this disk.
     """
 
-    def __init__(self, table=None):
-        self._table = table if table is not None else directory_table
-        self._by_extension = {}
+    def __init__(self, roster=None):
+        self._roster = roster if roster is not None else file_directory
         self._loaded = False
         self.misses = set()
 
@@ -239,32 +240,16 @@ class AgentCache:
         if self._loaded:
             return
         self._loaded = True
-        if self._table is None:
-            batch("roster: no directory table (local backend) — using agents.json")
+        agents = self._roster.all_agents()
+        if not agents:
+            # Not fatal, and deliberately so: an empty roster drops every call
+            # as off-roster and rolls the day up under UNASSIGNED, which is
+            # loud enough to find. Refusing to start would be defensible, but
+            # it would also stop a run over a file a redeploy can fix.
+            warn("batch", f"roster: {self._roster.path} is empty or unreadable "
+                          f"— every call will be treated as off-roster")
             return
-        try:
-            rows = self._table.load_all()
-        except Exception as exc:  # noqa: BLE001 -- see the class docstring
-            warn("batch", f"could not read the directory table ({exc!r}) — "
-                          f"falling back to agents.json for this run")
-            return
-        for row in rows:
-            if row.get("entity") != "AGENT":
-                continue
-            extension = str(row.get("extension") or "").strip()
-            if not extension:
-                continue
-            self._by_extension[extension] = Agent(
-                extension=extension,
-                name=row.get("agentName") or "",
-                did=row.get("did") or "",
-                accountId=row.get("accountId") or "",
-                known=True,
-                tl=row.get("teamLeaderName") or "",
-                state=row.get("team") or "",
-            )
-        batch(f"roster: {len(self._by_extension)} agents cached from the "
-              f"directory table")
+        batch(f"roster: {len(agents)} agents from {self._roster.path}")
 
     def rostered(self, extension):
         """Whether this extension is one of ours, by extension number alone.
@@ -273,31 +258,35 @@ class AgentCache:
         and a DID can be shared by a hunt group -- so a call from an extension
         nobody has listed can match one and come back `known`, which is fine for
         naming a call and wrong for deciding whether the call is ours at all.
-
-        The roster is the directory table when it loaded and agents.json when it
-        did not, which is the same precedence `resolve` uses: the table is what
-        a deploy updates and the file is what a developer edits.
         """
         self.load()
         extension = str(extension or "").strip()
         if not extension:
             return False
-        if extension in self._by_extension:
-            return True
         # No `did` passed, so this is the extension/accountId lookup and never
         # the DID fallback.
-        return file_directory.resolve(extension).known
+        return self._roster.resolve(extension).known
+
+    def all_agents(self):
+        """The whole roster.
+
+        Public because the roll-up builder needs it whole rather than one
+        extension at a time: two agents on a team who share a name have to be
+        told apart the same way on every day, including a day only one of them
+        worked.
+        """
+        self.load()
+        return [a for a in self._roster.all_agents() if a.extension]
 
     def resolve(self, extension, did=""):
+        """Extension, then accountId, then DID, then a placeholder.
+
+        The placeholder is what keeps an unknown extension visible on the
+        dashboard -- filed under "Unmapped extension NNN" -- instead of the call
+        being dropped and the roster gap never being noticed.
+        """
         self.load()
-        agent = self._by_extension.get(str(extension or "").strip())
-        if agent is not None:
-            return agent
-        # Not in the table. The file directory knows about accountId and DID
-        # fallbacks and produces the "Unmapped extension NNN" placeholder, which
-        # is what keeps an unknown extension visible on the dashboard instead of
-        # dropping the call.
-        resolved = file_directory.resolve(extension, did)
+        resolved = self._roster.resolve(extension, did)
         if not resolved.known:
             self.misses.add(str(extension or "?"))
         return resolved
@@ -313,13 +302,12 @@ class Collected:
         # Calls whose agent extension is not on the roster. Cloud Connect's call
         # log covers every extension on the tenant -- other departments, IVR
         # legs, test handsets -- and a call that is not one of our agents' is
-        # not ours to download, store or audit. Dropped outright rather than
-        # stored SKIPPED: a SKIPPED row is a permanent answer worth 200 bytes
-        # for a call we might otherwise re-check, and this test is a dict lookup
-        # that costs nothing to repeat on every run.
+        # not ours to download, store or audit. Dropped with no row, because
+        # the test is a dict lookup and costs nothing to repeat every run.
         self.off_roster = 0
+        # Fetched, ours, and not auditable -- never answered, or the PBX kept
+        # no recording. Counted, not stored.
         self.skipped = 0
-        self.skipped_written = 0
         self.todo = []              # [(CallLogRecord, Agent)] -- the work list
         self.failed_slices = []     # [(start, end, reason)]
         self.capped = False
@@ -468,8 +456,9 @@ def sort_records(records, repository=None, agents=None, dry_run=False,
     """Step 3. The three-way split.
 
     `dry_run` does every read and no write, so the counts are exactly what a
-    real run would produce -- including the SKIPPED pile, which it reports but
-    does not store.
+    real run would produce. Since neither the off-roster pile nor the
+    not-auditable pile is stored any more, the only difference a real run makes
+    here is the rows step 4 goes on to write.
     """
     repository = repository or calls_repo
     agents = agents or AgentCache()
@@ -540,15 +529,17 @@ def sort_records(records, repository=None, agents=None, dry_run=False,
                 reason += ", no recording"
             result.skipped += 1
             skip_reasons[reason] += 1
-            if not dry_run:
-                row = CallRow.from_call_log(
-                    record, agent, ProcessingStatus.SKIPPED
-                )
-                # Stored rather than dropped. A call that is simply absent is
-                # one this step rediscovers and re-checks on every run, forever;
-                # a SKIPPED row is a permanent answer that costs 200 bytes.
-                if repository.put_if_absent(row):
-                    result.skipped_written += 1
+            # Dropped rather than stored. This used to be a SKIPPED row, on the
+            # reasoning that a call which is simply absent is one this step
+            # rediscovers and re-checks on every run forever -- true, but the
+            # re-check is `call_status` and `call_rec_path` on a row already in
+            # hand, costing nothing, while the row cost 200 bytes and put two
+            # thirds of the table in front of every reader who then had to
+            # filter it out.
+            #
+            # The call log stays the record of what was not audited, and the
+            # `skipped` count with its reasons goes on the run row, which is
+            # where "what did last night leave out?" is answered.
             trace("batch", f"  SKIP {call_id}: {reason} ({record.call_sec}s, "
                            f"ext={record.agent_extension})",
                   level=logging.DEBUG)
@@ -571,7 +562,7 @@ def sort_records(records, repository=None, agents=None, dry_run=False,
         warn("batch", f"{len(agents.misses)} extension(s) are not in the "
                       f"roster and their calls are filed under a placeholder: "
                       f"{', '.join(sorted(agents.misses)[:10])}. Add them to "
-                      f"agents.json and re-sync the directory table.")
+                      f"agents.json — it is the roster.")
 
     if result.off_roster:
         batch(f"  off roster — {result.off_roster} call(s) across "
@@ -585,7 +576,6 @@ def sort_records(records, repository=None, agents=None, dry_run=False,
 
     batch(f"step 3 done: {result.already_known} already known, "
           f"{result.off_roster} off roster, "
-          f"{result.skipped} not auditable"
-          f"{'' if dry_run else f' ({result.skipped_written} rows written)'}, "
+          f"{result.skipped} not auditable, "
           f"{len(result.todo)} to ingest")
     return result

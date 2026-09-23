@@ -9,8 +9,10 @@
         "arn:aws:dynamodb:*:881174216402:table/call-audit-users",
         "arn:aws:dynamodb:*:881174216402:table/calls",
         "arn:aws:dynamodb:*:881174216402:table/calls/index/*",
-        "arn:aws:dynamodb:*:881174216402:table/directory",
-        "arn:aws:dynamodb:*:881174216402:table/directory/index/*"
+        "arn:aws:dynamodb:*:881174216402:table/rollups",
+        "arn:aws:dynamodb:*:881174216402:table/rollups/index/*",
+        "arn:aws:dynamodb:*:881174216402:table/sessions",
+        "arn:aws:dynamodb:*:881174216402:table/sessions/index/*"
       ]
     },
     {

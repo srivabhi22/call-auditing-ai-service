@@ -43,6 +43,7 @@ Two ways to spend nothing while testing:
     4  ingest    download each recording to S3, row goes UNPROCESSED
     5  dispatch  put every UNPROCESSED call id on the queue
     6  audit     workers drain the queue: pipeline -> four JSONs in S3 -> PROCESSED
+    6b rollup    re-sum every day this run touched into the `rollups` table
     7  control   write the run summary
 
 **Nothing is carried between runs.** The window is computed from the clock, not
@@ -99,9 +100,8 @@ failure modes rather than preferences:
   rather than widening the calls repository, because widening it would mean
   every caller of `get()` has to start asking whether what came back is a call.
 
-Anything that walks the whole table -- `seed_demo --check`, and any aggregation
-the read side does -- has to filter on `PK` beginning `CALL#` for the same
-reason. A control row counted as a call is a wrong number on a dashboard that
+Anything that walks the whole table -- any aggregation the read side does --
+has to filter on `PK` beginning `CALL#` for the same reason. A control row counted as a call is a wrong number on a dashboard that
 nobody can explain.
 """
 
@@ -113,9 +113,10 @@ from datetime import timedelta
 from ..common.config import settings
 from ..common.models import ProcessingStatus, iso, utcnow
 from ..common import store
-from ..common.store import calls as calls_repo
+from ..common.store import calls as calls_repo, sessions as sessions_repo
 from ..common.trace import batch, set_run_id, warn, error
-from . import audit as audit_step, collect, ingest, queue as queue_step
+from . import (audit as audit_step, collect, ingest, queue as queue_step,
+               rollup as rollup_step)
 from .audit import ModelGuardError
 from .queue import job_queue
 
@@ -250,7 +251,7 @@ class Run:
     def __init__(self, mode="full", dry_run=False, window_start=None,
                  window_end=None, max_calls=None, deadline_min=None,
                  repository=None, store=None, control=None, client=None,
-                 queue=None):
+                 queue=None, roster=None):
         self.mode = mode                  # full | collect | audit
         self.dry_run = dry_run
         self.window_start = window_start
@@ -263,6 +264,9 @@ class Run:
         self.control = control or run_rows
         self.client = client
         self.queue = queue or job_queue
+        # `agents.json`, read from disk. One per run, shared by the roster
+        # filter in step 3 and the publish in step 0 so they cannot differ.
+        self.roster = roster or collect.AgentCache()
 
         self.run_id = new_run_id()
         self.started_at = utcnow()
@@ -339,6 +343,7 @@ class Run:
                 "mode": self.mode,
                 "deadline": iso(self.deadline),
             })
+            self._session_start()
             return self._body()
         except Exception as exc:  # noqa: BLE001 -- the summary is written in
             # the finally below whatever happened here.
@@ -351,6 +356,22 @@ class Run:
         """Steps 1 to 6. The run summary is around it."""
         period = None
         collected = None
+
+        # Step 0: the roster, to S3. The dashboard is a separate deployment and
+        # cannot read `agents.json` off this disk, so every run republishes it.
+        # It is ~2 KB and idempotent, and doing it here rather than on a
+        # schedule means the roster the dashboard groups by is always the one
+        # this run filtered on -- the two disagreeing is a whole month of
+        # reports quietly attributed to the wrong people.
+        #
+        # Never fatal. A run that audits calls correctly but could not rewrite a
+        # roster that has not changed is not a failed run.
+        try:
+            published = store.publish_roster(self.roster.all_agents(), self.store)
+            batch(f"roster: {len(published['agents'])} agent(s) published to "
+                  f"{store.ROSTER_KEY}")
+        except Exception as exc:  # noqa: BLE001 -- see above
+            self._partial(f"roster not published: {exc!r}")
 
         if self.mode in ("full", "collect"):
             # --- step 1 --------------------------------------------------
@@ -426,11 +447,113 @@ class Run:
                          datesTouched=sorted(audited.dates))
             for call_id, reason in audited.failures:
                 self._partial(f"audit {call_id}: {reason}")
+
+            # --- step 6b -------------------------------------------------
+            # The days this run changed are re-summed into the `rollups`
+            # table, so the dashboard adds up a span of small rows instead of
+            # re-aggregating every call in it on every read.
+            #
+            # Here rather than in the audit worker because a roll-up is a
+            # whole day and the day is only finished once the workers are:
+            # summing it per call would be one full-day rebuild per call, and
+            # incrementing it per call would drift the first time a call is
+            # re-audited. Failures are absorbed -- these rows are a read-side
+            # convenience, and a day that could not be summed is fixed with
+            # `backend.tools.build_rollups`, not by failing a run whose calls
+            # are all safely audited.
+            self._rollup(audited.dates)
         else:
             batch(f"mode={self.mode}: the work is queued, this pod is not "
                   f"auditing it")
 
         return self._exit_code()
+
+    def _rollup(self, dates):
+        """Step 6b. Re-sum the days this run touched."""
+        if not dates:
+            return
+        try:
+            counts = rollup_step.rebuild_days(sorted(dates))
+        except Exception as exc:  # noqa: BLE001 -- see the call site
+            warn("batch", f"could not build the day roll-ups: {exc!r}")
+            self._record(rollupDaysFailed=len(dates))
+            return
+        self._record(**counts)
+        if counts["rollupDaysFailed"]:
+            warn("batch", f"{counts['rollupDaysFailed']} day(s) were not "
+                          f"rolled up — the dashboard will be short those "
+                          f"days until a run touches them again")
+
+    # -- the session marker -----------------------------------------------
+    #
+    # `RUN#` says what the run did, in detail, in the calls table. The session
+    # row says one thing, in a table of its own: is this session still working,
+    # or has every job it took on reached a final state? That is the question
+    # anything downstream asks -- an export, a report mailer, a dashboard
+    # banner -- and it should not have to read and interpret a run summary to
+    # answer it.
+
+    @property
+    def session_id(self):
+        """`SESSION#<this>`. The run's own start, so both rows share a
+        partition however many hours apart they are written."""
+        return iso(self.started_at)
+
+    def _session_start(self):
+        try:
+            sessions_repo.start(
+                self.session_id,
+                runId=self.run_id,
+                mode=self.mode,
+                host=self.holder,
+                deadline=iso(self.deadline),
+                pipelineMode=settings.pipeline_mode,
+            )
+        except Exception as exc:  # noqa: BLE001 -- bookkeeping must not be
+            # able to fail a run that is otherwise working.
+            warn("batch", f"could not write the PENDING session row: {exc!r}")
+
+    def _session_complete(self, summary):
+        """Replace PENDING with COMPLETED, once every job has been taken up.
+
+        Called from `_finish`, which runs whatever happened -- so "completed"
+        here means *the session is over*, not that every call in it succeeded.
+        The counts say how it went, and `outcome` carries OK / PARTIAL /
+        FAILED. A session that never gets here keeps its PENDING row, which is
+        exactly what a killed pod should leave behind.
+        """
+        processed = int(self.counts.get("audited", 0) or 0)
+        failed = (int(self.counts.get("auditFailed", 0) or 0)
+                  + int(self.counts.get("auditRetryable", 0) or 0)
+                  + int(self.counts.get("ingestFailed", 0) or 0))
+        try:
+            sessions_repo.complete(
+                self.session_id,
+                runId=self.run_id,
+                mode=self.mode,
+                host=self.holder,
+                outcome=self.outcome,
+                finishedAt=summary["finishedAt"],
+                durationSec=summary["durationSec"],
+                # The two numbers asked for, and the three that make them
+                # readable: a session can end with jobs it never reached
+                # (the deadline cut it short) or ones it deliberately skipped
+                # (already PROCESSED, or no longer auditable), and lumping
+                # either into "failed" would be a wrong number nobody can
+                # explain.
+                totalCallsProcessed=processed,
+                callsFailed=failed,
+                callsSkipped=int(self.counts.get("auditSkipped", 0) or 0),
+                callsNotReached=int(self.counts.get("auditNotReached", 0) or 0),
+                callsQueued=int(self.counts.get("queued", 0) or 0),
+                queueRemaining=summary["queueRemaining"],
+                failureCount=summary["failureCount"],
+            )
+            batch(f"session {self.session_id} COMPLETED — "
+                  f"{processed} processed, {failed} failed")
+        except Exception as exc:  # noqa: BLE001 -- see `_session_start`
+            warn("batch", f"could not complete the session row: {exc!r} — it "
+                          f"stays PENDING")
 
     # -- step 7 -----------------------------------------------------------
 
@@ -462,6 +585,7 @@ class Run:
             "failureCount": len(self.failures),
         }
         self._record(**summary)
+        self._session_complete(summary)
 
         batch(f"run {self.run_id} {self.outcome} in {summary['durationSec']}s — "
               + ", ".join(f"{k}={v}" for k, v in sorted(self.counts.items())

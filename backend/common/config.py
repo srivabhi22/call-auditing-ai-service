@@ -153,10 +153,31 @@ class Settings:
     # with no real caller. See backend/common/store.py.
     audio_bucket = os.environ.get("AUDIO_BUCKET", "call-auditing-media")
     calls_table = os.environ.get("CALLS_TABLE", "calls")
-    # The roster. Its own table rather than more item collections in `calls`:
-    # it has a completely different write rate -- eight rows changing monthly
-    # against thousands a night -- and it is cached whole in-process.
-    directory_table = os.environ.get("DIRECTORY_TABLE", "directory")
+    # The roster is not a table. It is `agents.json` at the repo root, read
+    # from disk by `common/agents.py` and published to S3 under `roster/` for
+    # the dashboard, which runs elsewhere and cannot read this disk. There was
+    # a `directory` table; it held a transcription of that same file, kept in
+    # step by remembering to run a seeding command, and two rosters that can
+    # disagree is worse than one that can be out of date.
+    # The day roll-ups. One row per scope (the floor, a team, an agent) per
+    # day, holding the sums the dashboard used to recompute on every read by
+    # walking GSI-3 over the window. A month of the floor is 30 rows here
+    # against ~90,000 call rows aggregated in the API process, and the numbers
+    # are additive, so a span is a range query and a sum.
+    #
+    # Its own table rather than more item collections in `calls` for the same
+    # reason the roster is: a completely different write rate and lifetime --
+    # a few hundred rows rewritten at the end of a run, against thousands of
+    # single-row mutations a night -- and nothing joins the two in one query.
+    rollups_table = os.environ.get("ROLLUPS_TABLE", "rollups")
+    # One row per processing session: written PENDING when a run starts and
+    # replaced by a COMPLETED one when every job it queued has been taken up
+    # and finished. Separate from the `RUN#` control row in `calls`, which is
+    # the run's own detailed bookkeeping -- this is the single flag anything
+    # downstream (an export, a report mailer, a dashboard banner) waits on, and
+    # it is a table so that "is the night finished?" is one query rather than a
+    # filtered read of the calls table.
+    sessions_table = os.environ.get("SESSIONS_TABLE", "sessions")
     aws_region = os.environ.get("AWS_REGION", "ap-south-1")
 
     # Only for DynamoDB Local, LocalStack or MinIO. Unset against real AWS.
