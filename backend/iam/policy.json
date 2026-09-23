@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Tables",
+      "Effect": "Allow",
+      "Action": "dynamodb:*",
+      "Resource": [
+        "arn:aws:dynamodb:*:881174216402:table/call-audit-users",
+        "arn:aws:dynamodb:*:881174216402:table/calls",
+        "arn:aws:dynamodb:*:881174216402:table/calls/index/*",
+        "arn:aws:dynamodb:*:881174216402:table/directory",
+        "arn:aws:dynamodb:*:881174216402:table/directory/index/*"
+      ]
+    },
+    {
+      "Sid": "MediaBucket",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::call-auditing-media-test",
+        "arn:aws:s3:::call-auditing-media-test/*"
+      ]
+    }
+  ]
+}

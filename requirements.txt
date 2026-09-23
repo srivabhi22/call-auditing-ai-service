@@ -1,0 +1,27 @@
+# Installed into .venv with `uv venv && uv pip install -r requirements.txt`.
+#
+# Pinned to a minor line rather than left open. An image rebuilt three months
+# from now must contain what was tested, and `boto3` alone ships several
+# releases a week.
+
+# The HTTP trigger. This was a job with no web surface and before that a service
+# with a webhook; it is a service again, because "run it when the pod comes up"
+# and "run it from a scheduler" are the same request and a CLI could serve only
+# one of them.
+fastapi~=0.141
+# The server. `[standard]` brings uvloop and httptools, which matter for a
+# process that has to keep answering health probes while 25 worker threads are
+# saturating it.
+uvicorn[standard]~=0.34
+
+# DynamoDB and S3. Credentials come from the default chain -- the pod's IAM role
+# in production, never a key in configuration.
+boto3~=1.35
+
+# audit_schema.py validates the audit document, and the API validates its
+# request bodies. FastAPI requires v2.
+pydantic~=2.9
+
+# Ships an ffmpeg binary inside the venv, so recordings can be re-encoded to
+# 16 kHz mono before transcription without ffmpeg being installed on the host.
+imageio-ffmpeg~=0.5
